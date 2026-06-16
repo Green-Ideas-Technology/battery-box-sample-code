@@ -2,7 +2,7 @@ import logging
 import struct
 from enum import IntEnum
 from rs485_manager import RS485Manager
-from battery_structures import BspBsmPlbModbus, Bsp4015Info, BatteryType
+from battery_structures import AlarmInfo, BspBsmPlbModbus, Bsp4015Info, BatteryType
 
 
 class M3ControllerError(IntEnum):
@@ -713,3 +713,157 @@ class M3Controller:
         except Exception as e:
             self.logger.exception(f"解析M3韌體版本數據時發生錯誤: {e}")
             return M3ControllerError.FAIL, "Unknown"
+
+    def get_alarm_status(self) -> tuple[M3ControllerError, AlarmInfo]:
+        """
+        查詢警報狀態
+        :return: (錯誤碼, 警報資訊)
+        """
+        self.logger.debug("開始查詢警報狀態")
+
+        command = 0x46
+        data = bytearray([0x00])
+
+        success, response = self.rs485.send_command(
+            command,
+            data,
+            expected_response_cmd=0x86,
+            expect_response=True,
+            response_size=22,  # 封包頭(6) + RTC(8) + ALARM(3) + 其他(5) = 22 bytes
+        )
+
+        if not success or response is None:
+            self.logger.error("查詢警報狀態失敗: 無回應")
+            return M3ControllerError.TIMEOUT, None
+
+        if len(response) < 6 or response[0] != 0xCC or response[3] != 0x86:
+            self.logger.error(f"無效的警報狀態回應: {response.hex()}")
+            return M3ControllerError.INVALID_RESPONSE, None
+
+        try:
+            data_len = response[1] | (response[2] << 8)
+            self.logger.debug(f"完整回應: {response.hex()}")
+            self.logger.debug(
+                f"封包長度: {len(response)}, 宣告資料長度: {data_len}"
+            )
+
+            if len(response) < 6 + data_len:
+                self.logger.error(
+                    f"封包長度不足 - 宣告資料長度 {data_len}，需要 {6 + data_len} bytes，"
+                    f"實際收到 {len(response)} bytes"
+                )
+                return M3ControllerError.INVALID_RESPONSE, None
+
+            if data_len < 11:  # RTC(8) + ALARM(3) = 11 bytes
+                self.logger.error(
+                    f"資料長度不足 - 需要至少 11 bytes，實際 {data_len} bytes"
+                )
+                return M3ControllerError.INVALID_RESPONSE, None
+
+            # 解析 RTC 時間 (資料部分的前 8 bytes)
+            rtc_bytes = response[6 : 6 + 8]
+            try:
+                # 格式：Year(2, 小端序) + Month(1) + Day(1) + WeekDay(1) +
+                # Hour(1) + Minute(1) + Second(1)
+                year = (rtc_bytes[1] << 8) | rtc_bytes[0]
+                month = rtc_bytes[2]
+                day = rtc_bytes[3]
+                weekday = rtc_bytes[4]
+                hour = rtc_bytes[5]
+                minute = rtc_bytes[6]
+                second = rtc_bytes[7]
+                self.logger.debug(
+                    f"RTC時間: {year:04d}-{month:02d}-{day:02d} "
+                    f"{hour:02d}:{minute:02d}:{second:02d} (週{weekday})"
+                )
+            except Exception as e:
+                self.logger.debug(f"RTC解碼錯誤: {e}")
+
+            # 警報資料位於 header(6) + RTC(8) 之後
+            rtc_offset = 6 + 8
+            alarm_ltc4015 = response[rtc_offset]      # A0: LTC4015 警報
+            alarm_battery = response[rtc_offset + 1]  # A1: 電池警報
+            system_info = response[rtc_offset + 2]    # A2: 系統資訊
+
+            self.logger.debug(
+                f"警報資料: A0=0x{alarm_ltc4015:02X} "
+                f"A1=0x{alarm_battery:02X} A2=0x{system_info:02X}"
+            )
+
+            # 解析 LTC4015 警報位元
+            ltc4015_temp_95 = bool(alarm_ltc4015 & 0x01)   # bit0: 溫度超過 95°C
+            ltc4015_temp_105 = bool(alarm_ltc4015 & 0x02)  # bit1: 溫度超過 105°C
+            ltc4015_error = bool(alarm_ltc4015 & 0x80)     # bit7: LTC4015 錯誤
+
+            # 解析電池警報位元
+            bata_temp_65 = bool(alarm_battery & 0x01)  # bit0: BatA 溫度超過 65°C
+            bata_temp_75 = bool(alarm_battery & 0x02)  # bit1: BatA 溫度超過 75°C
+            batb_temp_65 = bool(alarm_battery & 0x10)  # bit4: BatB 溫度超過 65°C
+            batb_temp_75 = bool(alarm_battery & 0x20)  # bit5: BatB 溫度超過 75°C
+
+            # 解析系統資訊位元 (NOTICE_ALARM_FRAME)
+            # TODO 不要 handle UART command 的警報 system_reboot_uart 和
+            # output_12v_disable_uart
+            #
+            # bit0: System Reboot; LTC4015 error (after 30sec)
+            system_reboot_ltc4015 = bool(system_info & 0x01)
+            # bit1: System Reboot; UART command (after 30sec)
+            system_reboot_uart = bool(system_info & 0x02)
+            # bit2: System Stop; LTC4015 溫度過高 (after 30sec)
+            system_stop_ltc4015_temp = bool(system_info & 0x04)
+            # bit3: System Stop; 電池_A 溫度過高 (after 30sec)
+            system_stop_bata_temp = bool(system_info & 0x08)
+            # bit4: System Stop; 電池_B 溫度過高 (after 30sec)
+            system_stop_batb_temp = bool(system_info & 0x10)
+            # bit5: 12V output disable; UART command (after Xsec)
+            output_12v_disable_uart = bool(system_info & 0x20)
+            # bit6: 12V output disable; battery low power (after 60sec)
+            output_12v_disable_battery = bool(system_info & 0x40)
+            # bit7: NC (Not Connected)
+
+            # 只保留 need_maintenance 用於本地維護程序判斷
+            need_maintenance = (
+                # 系統重啟條件
+                system_reboot_ltc4015
+                or system_reboot_uart
+                or
+                # 系統停止條件
+                system_stop_ltc4015_temp
+                or system_stop_bata_temp
+                or system_stop_batb_temp
+                or
+                # 12V 輸出停用條件
+                output_12v_disable_uart
+                or output_12v_disable_battery
+            )
+
+            alarm_info = AlarmInfo(
+                need_maintenance=need_maintenance,
+                ltc4015_temp_95=ltc4015_temp_95,
+                ltc4015_temp_105=ltc4015_temp_105,
+                ltc4015_error=ltc4015_error,
+                bata_temp_65=bata_temp_65,
+                bata_temp_75=bata_temp_75,
+                batb_temp_65=batb_temp_65,
+                batb_temp_75=batb_temp_75,
+                system_reboot_ltc4015=system_reboot_ltc4015,
+                system_reboot_uart=system_reboot_uart,
+                system_stop_ltc4015_temp=system_stop_ltc4015_temp,
+                system_stop_bata_temp=system_stop_bata_temp,
+                system_stop_batb_temp=system_stop_batb_temp,
+                output_12v_disable_uart=output_12v_disable_uart,
+                output_12v_disable_battery=output_12v_disable_battery,
+                raw_ltc4015=alarm_ltc4015,
+                raw_battery=alarm_battery,
+                raw_system=system_info,
+            )
+
+            status = "正常" if not need_maintenance else "警報"
+            self.logger.debug(f"警報狀態: {status}")
+
+            return M3ControllerError.OK, alarm_info
+
+        except Exception as e:
+            self.logger.exception(f"解析警報狀態數據時發生錯誤: {e}")
+            return M3ControllerError.FAIL, None
+

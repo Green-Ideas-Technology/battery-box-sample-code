@@ -90,6 +90,39 @@ class ApsStatus(IntEnum):
 
 
 @dataclass
+class AlarmInfo:
+    """對應原始 C 中的 NOTICE_ALARM_FRAME 警報狀態結構"""
+
+    # 維護旗標
+    need_maintenance: bool = False  # 是否需要維護
+
+    # LTC4015 警報 (A0)
+    ltc4015_temp_95: bool = False   # bit0: 溫度超過 95°C
+    ltc4015_temp_105: bool = False  # bit1: 溫度超過 105°C
+    ltc4015_error: bool = False     # bit7: LTC4015 錯誤
+
+    # 電池警報 (A1)
+    bata_temp_65: bool = False  # bit0: BatA 溫度超過 65°C
+    bata_temp_75: bool = False  # bit1: BatA 溫度超過 75°C
+    batb_temp_65: bool = False  # bit4: BatB 溫度超過 65°C
+    batb_temp_75: bool = False  # bit5: BatB 溫度超過 75°C
+
+    # 系統資訊 (A2)
+    system_reboot_ltc4015: bool = False       # bit0: 系統重啟; LTC4015 錯誤 (after 30sec)
+    system_reboot_uart: bool = False          # bit1: 系統重啟; UART 命令 (after 30sec)
+    system_stop_ltc4015_temp: bool = False    # bit2: 系統停止; LTC4015 溫度過高 (after 30sec)
+    system_stop_bata_temp: bool = False       # bit3: 系統停止; 電池_A 溫度過高 (after 30sec)
+    system_stop_batb_temp: bool = False       # bit4: 系統停止; 電池_B 溫度過高 (after 30sec)
+    output_12v_disable_uart: bool = False     # bit5: 12V 輸出停用; UART 命令 (after Xsec)
+    output_12v_disable_battery: bool = False  # bit6: 12V 輸出停用; 電池電量不足 (after 60sec)
+
+    # 原始位元組
+    raw_ltc4015: int = 0  # A0 原始值
+    raw_battery: int = 0  # A1 原始值
+    raw_system: int = 0   # A2 原始值
+
+
+@dataclass
 class Bsp4015Info:
     """對應原始 C 中的 Bsp4015Info 結構"""
 
